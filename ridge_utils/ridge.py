@@ -66,42 +66,73 @@ def ridge(stim, resp, alpha, singcutoff=1e-10, normalpha=False, logger=ridge_log
 
     return wt
 
-def ridge_projected(stim, resp, alpha, up_projection_components,
-                    projection_map_y, singcutoff=1e-10, normalpha=False, 
-                    y_projection="pca", logger=ridge_logger):
-    """Computes ridge regression weights for a model where the response variable is projected through something like PCA."""
-
-    try:
-        U, S, Vh = np.linalg.svd(stim, full_matrices=False)
-    except np.linalg.LinAlgError:
-        logger.error("SVD failed.")
-        return None
-
+def ridge_projected(stim, resp, alpha, up_projection_components, projection_map_y, 
+                   singcutoff=1e-10, normalpha=False, logger=ridge_logger):
+    """
+    Performs ridge regression in projected Y space with a single alpha value.
+    
+    Parameters
+    ----------
+    stim : array_like, shape (T, N)
+        Stimulus matrix with T timepoints and N features
+    resp : array_like, shape (T, M)  
+        Response matrix with T timepoints and M responses
+    alpha : float
+        Single regularization parameter applied uniformly in projected space
+    up_projection_components : array_like, shape (n_components, M)
+        Matrix to project from reduced space back to original response space
+    projection_map_y : sklearn transformer
+        Fitted projection (e.g., PCA) that transforms resp to reduced space
+    singcutoff : float, default 1e-10
+        Cutoff for removing small singular values
+    normalpha : bool, default False
+        Whether to normalize alpha by largest singular value
+    
+    Returns
+    -------
+    wt : array_like, shape (N, M)
+        Ridge regression weights in original response space
+    """
+    # Ensure alpha is a single value
+    if not isinstance(alpha, (float, int)):
+        raise ValueError("alpha must be a single float/int value")
+    
+    # Project responses to reduced space
     resp_projected = projection_map_y.transform(resp)
     n_components = resp_projected.shape[1]
     
-    UR = np.dot(U.T, np.nan_to_num(resp_projected))
-
-    if isinstance(alpha, (float, int)):
-        alpha = np.ones(n_components) * alpha
+    # Compute SVD of stimulus
+    try:
+        U, S, Vh = np.linalg.svd(stim, full_matrices=False)
+    except np.linalg.LinAlgError:
+        logger.info("NORMAL SVD FAILED, trying more robust dgesvd..")
+        from text.regression.svd_dgesvd import svd_dgesvd
+        U, S, Vh = svd_dgesvd(stim, full_matrices=False)
     
-    if len(alpha) != n_components:
-        raise ValueError(f"Alpha must have length equal to the number of components ({n_components}).")
-
+    # Remove tiny singular values
+    good_s_mask = S > singcutoff
+    U = U[:, good_s_mask]
+    S = S[good_s_mask]
+    Vh = Vh[good_s_mask]
+    
+    # Compute UR for projected responses
+    UR = np.dot(U.T, np.nan_to_num(resp_projected))
+    
+    # Apply normalization if requested
     norm = S[0]
-    nalphas = alpha * norm if normalpha else alpha
-
-    ualphas = np.unique(nalphas)
-    wt_projected = np.zeros((stim.shape[1], n_components))
-
-    for ua in ualphas:
-        sel_components = np.nonzero(nalphas == ua)[0]
-        awt = Vh.T.dot(np.diag(S / (S**2 + ua**2))).dot(UR[:, sel_components])
-        wt_projected[:, sel_components] = awt
-
+    normalized_alpha = alpha * norm if normalpha else alpha
+    
+    logger.info(f"Using alpha={alpha:.6f} (normalized: {normalized_alpha:.6f}) "
+                f"for {n_components} components")
+    
+    # Compute ridge weights in projected space
+    D = S / (S**2 + normalized_alpha**2)
+    wt_projected = Vh.T.dot(np.diag(D)).dot(UR)
+    
+    # Project weights back to original space
     wt = wt_projected @ up_projection_components
+    
     return wt
-
     
 
 def ridge_corr_pred(Rstim, Pstim, Rresp, Presp, valphas, normalpha=False,
@@ -329,37 +360,79 @@ def ridge_corr(Rstim, Pstim, Rresp, Presp, alphas, normalpha=False, corrmin=0.2,
     
     return Rcorrs
 
-
-def ridge_corr_with_projection(Rstim, Pstim, Rresp, Presp, alphas, normalpha=False, 
-                               use_corr=True, projection_map_y=None, up_projection_map=None, logger=ridge_logger):
-    """Calculates ridge correlations with projection on Y."""
-    U,S,Vh = np.linalg.svd(Rstim, full_matrices=False)
+def ridge_corr_with_projection(Rstim, Pstim, Rresp, Presp, alphas, 
+                              up_projection_components, projection_map_y,
+                              normalpha=False, use_corr=True, 
+                              singcutoff=1e-10, logger=ridge_logger):
+    """
+    Evaluate ridge regression performance with projection, correctly evaluating 
+    performance in the original (up-projected) space.
     
-    norm = S[0]
-    nalphas = alphas * norm if normalpha else alphas
-
-    Rresp_projected = projection_map_y.transform(Rresp)
-    UR = np.dot(U.T, Rresp_projected)
-    PVh = np.dot(Pstim, Vh.T)
+    Key difference from original: This function trains in projected space but 
+    evaluates performance in the ORIGINAL space after up-projection.
     
-    zPresp = zs(Presp)
-    Prespvar = Presp.var(0)
+    Parameters
+    ----------
+    Rstim, Pstim : array_like
+        Training and test stimuli
+    Rresp, Presp : array_like  
+        Training and test responses
+    alphas : array_like
+        Alpha values to test
+    up_projection_components : array_like, shape (n_components, M)
+        Matrix to project from reduced space back to original response space
+    projection_map_y : sklearn transformer
+        Fitted projection transformer
+    normalpha : bool
+        Whether to normalize alphas
+    use_corr : bool
+        Whether to use correlation (True) or R² (False) as metric
+    
+    Returns
+    -------
+    Rcorrs : list
+        Correlation/R² values for each alpha, evaluated in ORIGINAL space
+    """
+    # Precompute z-scored test responses for correlation calculation
+    if use_corr:
+        zPresp = zs(Presp)
+        Prespvar = None
+    else:
+        zPresp = None
+        Prespvar = Presp.var(0)
+        # Handle zero variance case
+        Prespvar[Prespvar == 0] = 1.0
     
     Rcorrs = []
-    for na in nalphas:
-        D = S / (S ** 2 + na ** 2)
-        pred_projected = PVh @ np.diag(D) @ UR
-        pred = up_projection_map(pred_projected)
+    
+    for alpha in alphas:
+        # Train ridge regression in projected space
+        wt = ridge_projected(Rstim, Rresp, alpha, up_projection_components, 
+                           projection_map_y, singcutoff=singcutoff, 
+                           normalpha=normalpha, logger=logger)
         
+        # Predict in ORIGINAL space (this is the key correction)
+        pred = Pstim @ wt
+        
+        # Evaluate performance in ORIGINAL space
         if use_corr:
+            # Correlation metric
             Rcorr = (zPresp * zs(pred)).mean(0)
         else:
+            # R-squared metric
             resvar = (Presp - pred).var(0)
             Rsq = 1 - (resvar / Prespvar)
             Rcorr = np.sqrt(np.abs(Rsq)) * np.sign(Rsq)
         
+        # Handle NaN values
         Rcorr[np.isnan(Rcorr)] = 0
         Rcorrs.append(Rcorr)
+        
+        # Log progress
+        mean_corr = np.mean(Rcorr)
+        max_corr = np.max(Rcorr)
+        logger.info(f"Alpha {alpha:.6f}: mean_corr={mean_corr:.5f}, max_corr={max_corr:.5f}")
+    
     return Rcorrs
 
 def bootstrap_ridge(Rstim, Rresp, Pstim, Presp, alphas, nboots, chunklen, nchunks,
@@ -543,71 +616,168 @@ def bootstrap_ridge(Rstim, Rresp, Pstim, Presp, alphas, nboots, chunklen, nchunk
         return [], corrs, valphas, allRcorrs, valinds
 
 
-def bootstrap_ridge_with_y_projection(Rstim, Rresp, Pstim, Presp, alphas, nboots, chunklen, nchunks,
-                    corrmin=0.2, joined=None, singcutoff=1e-10, normalpha=False, single_alpha=True,
-                    use_corr=True, return_wt=True, y_projection='I', 
-                    projection_map_y=None, up_projection_map=None, up_projection_components=None,
-                    logger=ridge_logger):
-    if y_projection == 'I':
-        raise NotImplementedError("Standard bootstrap_ridge should be called directly.")
-    if not single_alpha:
-        logger.warning("Forcing single_alpha=True.")
-
+def bootstrap_ridge_with_y_projection(Rstim, Rresp, Pstim, Presp, alphas, 
+                                     nboots, chunklen, nchunks,
+                                     up_projection_components, projection_map_y,
+                                     corrmin=0.2, singcutoff=1e-10, 
+                                     normalpha=False, use_corr=True, 
+                                     return_wt=True, y_projection='pca',
+                                     logger=ridge_logger):
+    """
+    Bootstrap ridge regression with Y projection, correctly optimized.
+    
+    This function finds the single best alpha by:
+    1. For each bootstrap sample and each alpha:
+       - Train ridge in projected space with that alpha
+       - Predict and evaluate performance in ORIGINAL space
+    2. Select alpha with best average performance in original space
+    3. Train final model with selected alpha
+    
+    Parameters
+    ----------
+    Rstim, Rresp : array_like
+        Training stimuli and responses
+    Pstim, Presp : array_like
+        Test stimuli and responses  
+    alphas : array_like
+        Alpha values to test via cross-validation
+    nboots : int
+        Number of bootstrap samples
+    chunklen, nchunks : int
+        Bootstrap sampling parameters
+    up_projection_components : array_like, shape (n_components, M)
+        Matrix to project from reduced space back to original response space
+    projection_map_y : sklearn transformer
+        Fitted projection transformer
+    corrmin : float
+        Minimum correlation for progress reporting
+    singcutoff : float
+        SVD singular value cutoff
+    normalpha : bool
+        Whether to normalize alpha values
+    use_corr : bool
+        Whether to use correlation (True) or R² (False)
+    return_wt : bool
+        Whether to compute and return final weights
+    y_projection : str, default 'pca'
+        Type of Y projection. If 'I', should call standard bootstrap_ridge instead.
+        
+    Returns
+    -------
+    wt : array_like or []
+        Final regression weights (if return_wt=True)
+    corrs : array_like
+        Final correlations on test set
+    best_alpha : float
+        Selected best alpha value
+    bootstrap_corrs : array_like
+        Bootstrap correlation results, shape (n_alphas, n_voxels, n_boots)
+    valinds : list
+        Validation indices for each bootstrap
+    """
     nresp, nvox = Rresp.shape
-    ncomponents = projection_map_y.n_components
+    
+    # Check if identity projection was requested
+    if y_projection == 'I':
+        raise NotImplementedError("Standard bootstrap_ridge should be called directly for identity projection.")
+    
+    logger.info(f"Starting bootstrap with {nboots} boots, {len(alphas)} alphas")
+    logger.info(f"Data: {nresp} timepoints, {nvox} voxels")
+    logger.info(f"Projection: {projection_map_y.n_components} components, type: {y_projection}")
+    
+    # Bootstrap cross-validation
     valinds = []
-    Rcmats = []
+    bootstrap_corrs = []  # Will be shape (n_alphas, n_voxels, n_boots)
     
     for bi in range(nboots):
+        logger.info(f"Bootstrap {bi+1}/{nboots}")
+        
+        # Create train/validation split
         allinds = list(range(nresp))
-        indchunks = list(zip(*[iter(allinds)]*chunklen))
+        indchunks = list(zip(*[iter(allinds)] * chunklen))
         random.shuffle(indchunks)
         heldinds = list(itools.chain(*indchunks[:nchunks]))
-        notheldinds = list(set(allinds)-set(heldinds))
+        notheldinds = list(set(allinds) - set(heldinds))
         valinds.append(heldinds)
         
-        RRstim, PRstim = Rstim[notheldinds,:], Rstim[heldinds,:]
-        RRresp, PRresp = Rresp[notheldinds,:], Rresp[heldinds,:]
+        # Split data
+        RRstim, PRstim = Rstim[notheldinds, :], Rstim[heldinds, :]
+        RRresp, PRresp = Rresp[notheldinds, :], Rresp[heldinds, :]
         
-        Rcmat = ridge_corr_with_projection(RRstim, PRstim, RRresp, PRresp, alphas,
-                                           normalpha=normalpha, use_corr=use_corr, 
-                                           projection_map_y=projection_map_y,
-                                           up_projection_map=up_projection_map,
-                                           logger=logger)
-        Rcmats.append(Rcmat)
+        # Test each alpha and evaluate in ORIGINAL space
+        boot_corrs = ridge_corr_with_projection(
+            RRstim, PRstim, RRresp, PRresp, alphas,
+            up_projection_components, projection_map_y,
+            normalpha=normalpha, use_corr=use_corr, 
+            singcutoff=singcutoff, logger=logger
+        )
+        
+        bootstrap_corrs.append(boot_corrs)
     
-    if nboots > 0:
-        allRcorrs = np.dstack(Rcmats)
-        mean_corr_per_alpha = allRcorrs.mean(axis=2).mean(axis=1)
-        best_alpha_idx = np.argmax(mean_corr_per_alpha)
-        best_alpha = alphas[best_alpha_idx]
-        logger.info(f"Best alpha found: {best_alpha:.4f} (avg correlation: {mean_corr_per_alpha[best_alpha_idx]:.4f})")
-    else: 
-        best_alpha = alphas[0]
-        allRcorrs = None
-
-    valphas = np.array([best_alpha] * ncomponents)
-
+    # Convert to array: (n_boots, n_alphas, n_voxels) -> (n_alphas, n_voxels, n_boots)
+    bootstrap_corrs = np.array(bootstrap_corrs)  # (n_boots, n_alphas, n_voxels)
+    bootstrap_corrs = np.transpose(bootstrap_corrs, (1, 2, 0))  # (n_alphas, n_voxels, n_boots)
+    
+    # Find best alpha based on mean performance across voxels and boots
+    mean_corr_per_alpha = bootstrap_corrs.mean(axis=(1, 2))  # Average over voxels and boots
+    best_alpha_idx = np.argmax(mean_corr_per_alpha)
+    best_alpha = alphas[best_alpha_idx]
+    
+    logger.info(f"Best alpha selected: {best_alpha:.6f}")
+    logger.info(f"Best alpha mean correlation: {mean_corr_per_alpha[best_alpha_idx]:.5f}")
+    
+    # Log all alpha performances
+    for i, (alpha, mean_corr) in enumerate(zip(alphas, mean_corr_per_alpha)):
+        marker = " <-- BEST" if i == best_alpha_idx else ""
+        logger.info(f"Alpha {alpha:.6f}: mean_corr={mean_corr:.5f}{marker}")
+    
     if return_wt:
-        wt = ridge_projected(Rstim, Rresp, valphas,
-                             up_projection_components=up_projection_components,
-                             projection_map_y=projection_map_y,
-                             singcutoff=singcutoff, normalpha=normalpha)
-        pred = np.dot(Pstim, wt)
+        # Train final model with best alpha on full training set
+        logger.info("Training final model with best alpha...")
+        wt = ridge_projected(Rstim, Rresp, best_alpha, up_projection_components,
+                           projection_map_y, singcutoff=singcutoff, 
+                           normalpha=normalpha, logger=logger)
+        
+        # Final prediction and evaluation
+        logger.info("Computing final test set performance...")
+        pred = Pstim @ wt
+        
         if use_corr:
             corrs = (zs(Presp) * zs(pred)).mean(0)
         else:
-            # R-squared calculation
             resvar = (Presp - pred).var(0)
             Presp_var = Presp.var(0)
-            Presp_var[Presp_var == 0] = 1 
+            Presp_var[Presp_var == 0] = 1.0  # Avoid division by zero
             Rsqs = 1 - (resvar / Presp_var)
             corrs = np.sqrt(np.abs(Rsqs)) * np.sign(Rsqs)
         
         corrs[np.isnan(corrs)] = 0
-        return wt, corrs, np.array([best_alpha]*nvox), allRcorrs, valinds
+        
+        logger.info(f"Final test performance: mean_corr={np.mean(corrs):.5f}, "
+                   f"max_corr={np.max(corrs):.5f}")
+        
+        return wt, corrs, best_alpha, bootstrap_corrs, valinds
+    
     else:
-        #... (TBD logic for no weight return) ...
-        return [], None, None, None, None
-
+        # Just compute correlations without storing weights
+        logger.info("Computing test correlations without storing weights...")
+        
+        # We need to recompute the prediction for the test set
+        wt = ridge_projected(Rstim, Rresp, best_alpha, up_projection_components,
+                           projection_map_y, singcutoff=singcutoff, 
+                           normalpha=normalpha, logger=logger)
+        pred = Pstim @ wt
+        
+        if use_corr:
+            corrs = (zs(Presp) * zs(pred)).mean(0)
+        else:
+            resvar = (Presp - pred).var(0)
+            Presp_var = Presp.var(0)
+            Presp_var[Presp_var == 0] = 1.0
+            Rsqs = 1 - (resvar / Presp_var)
+            corrs = np.sqrt(np.abs(Rsqs)) * np.sign(Rsqs)
+        
+        corrs[np.isnan(corrs)] = 0
+        
+        return [], corrs, best_alpha, bootstrap_corrs, valinds
 
